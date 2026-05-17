@@ -23,14 +23,16 @@ function Pause-Menu {
 
 function Get-LiveUSB {
     clear
-    Get-PnpDevice -Class DiskDrive -Status OK | Select Status, Class, FriendlyName, InstanceId | ft -auto
     
-    write-host ">>> Active Removable Drives (Since: $script:start)" -f Green
+    write-host ">>> Checking System for Removable Media..." -f Green
     $drives = Get-CimInstance Win32_LogicalDisk | ? {$_.DriveType -eq 2}
     
     if (-not $drives) {
-        write-host "No active USB storage found." -f Yellow
+        write-host "No active USB storage drive detected. Skipping file extractions." -f Yellow
     } else {
+        # Show physical disk drive properties if media is found
+        Get-PnpDevice -Class DiskDrive -Status OK | Select Status, Class, FriendlyName, InstanceId | ft -auto
+        
         $ws = New-Object -ComObject WScript.Shell
         $lnkFiles = [System.IO.Directory]::GetFiles("$env:APPDATA\Microsoft\Windows\Recent", "*.lnk")
 
@@ -42,53 +44,59 @@ function Get-LiveUSB {
             $pathLog = "$dlDir\Drive_${letter}_File_Paths.txt"
             $execLog = "$dlDir\Drive_${letter}_Ran_Files.txt"
             
-            "--- TREE FOR $letter ($script:start) ---" | out-file $treeLog -force
-            "--- PATHS FOR $letter ($script:start) ---" | out-file $pathLog -force
-            "--- EXECUTED FOR $letter ($script:start) ---" | out-file $execLog -force
-
             write-host "`nDrive [$($d.DeviceID)] -> $($d.VolumeName)" -f Green
-            write-host "  > Saving tree to: Downloads\Drive_${letter}_Folder_Tree.txt" -f Gray
-            write-host "  > Saving paths to: Downloads\Drive_${letter}_File_Paths.txt" -f Gray
             
+            # Extracts full trees and directories
             $fld = Get-ChildItem ($d.DeviceID + "\") -Recurse -Directory -EA 0
             $fls = Get-ChildItem ($d.DeviceID + "\") -Recurse -File -EA 0
             
-            $actFld = $fld | ? { $_.LastWriteTime -ge $script:start }
-            $actFls = $fls | ? { $_.LastWriteTime -ge $script:start -or $_.LastAccessTime -ge $script:start }
+            if ($fld) {
+                "--- FOLDER STRUCTURAL MAP FOR DRIVE $letter ---" | out-file $treeLog -force
+                $fld.FullName | out-file $treeLog -append
+                write-host "  > Folders mapped to: Drive_${letter}_Folder_Tree.txt" -f Gray
+            }
             
-            if ($actFld) { $actFld.FullName | out-file $treeLog -append } else { "No structural changes." | out-file $treeLog -append }
-            if ($actFls) { $actFls.FullName | out-file $pathLog -append } else { "No file updates." | out-file $pathLog -append }
+            if ($fls) {
+                "--- FILE PATH REGISTRY FOR DRIVE $letter ---" | out-file $pathLog -force
+                $fls.FullName | out-file $pathLog -append
+                write-host "  > File names mapped to: Drive_${letter}_File_Paths.txt" -f Gray
+            }
 
+            # Extracts ran/opened files via shell links if they match the session window
             $ran = 0
             foreach ($lnk in $lnkFiles) {
                 if ((gi $lnk).LastWriteTime -ge $script:start) {
                     try {
                         $tgt = $ws.CreateShortcut($lnk).TargetPath
                         if ($tgt -like "$($d.DeviceID)*") {
+                            if ($ran -eq 0) {
+                                "--- RUN LOGS FOR DRIVE $letter (Since: $script:start) ---" | out-file $execLog -force
+                            }
                             $tgt | out-file $execLog -append
-                            if ($ran++ -lt 15) { write-host "  [OPENED] $tgt" -f Yellow }
+                            if ($ran++ -lt 15) { write-host "  [LIVE INTERACTION] -> $tgt" -f Yellow }
                         }
                     } catch {}
                 }
             }
-            if ($ran -eq 0) { "No files executed." | out-file $execLog -append }
+            if ($ran -gt 0) {
+                write-host "  > Ran paths mapped to: Drive_${letter}_Ran_Files.txt" -f Cyan
+            }
         }
-        write-host "`n[+] Local logs dropped in Downloads folder." -f Green
     }
 
-    write-host "`n>>> Connection Log (Past 24h)" -f Cyan
-    $events = Get-WinEvent -FilterHashtable @{LogName='System'; ID=20001,20003; StartTime=(Get-Date).AddHours(-24)} -EA 0 | Sort TimeCreated
+    # Restored to exact 24-hour verification window using the absolute volume mount diagnostics channel
+    write-host "`n>>> Connection Log (Past 24h Windows History)" -f Cyan
+    $timeLimit = (Get-Date).AddHours(-24)
+    $events = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Partition/Diagnostic'; ID=1006; StartTime=$timeLimit} -EA 0 | Sort TimeCreated
     
     if ($events) {
         foreach ($e in $events) {
-            $status = if ($e.Id -eq 20001) { "Connected" } else { "Disconnected" }
-            $color = if ($e.Id -eq 20001) { "Green" } else { "Red" }
             $msg = $e.Message.Replace("`n"," ").Replace("`r","")
-            if ($msg.Length -gt 50) { $msg = $msg.Substring(0,47) + "..." }
-            write-host ("[{0}] {1,-12} ID:{2} - {3}" -f $e.TimeCreated.ToString("HH:mm:ss"), $status, $e.Id, $msg) -f $color
+            if ($msg.Length -gt 65) { $msg = $msg.Substring(0,62) + "..." }
+            write-host ("[{0}] Mounted Vol ID:{1} - {2}" -f $e.TimeCreated.ToString("HH:mm:ss"), $e.Id, $msg) -f Green
         }
     } else {
-        write-host "No recent connection logs found." -f Gray
+        write-host "No volume mounting events written to system logs within past 24 hours." -f Gray
     }
     Pause-Menu
 }
@@ -159,7 +167,6 @@ function Get-AuditPS {
     Pause-Menu
 }
 
-# Controlled loop to handle exit cleanly
 $running = $true
 while ($running) {
     Get-Menu
