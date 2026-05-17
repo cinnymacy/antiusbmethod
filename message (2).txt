@@ -1,209 +1,174 @@
-$MaxLogsToShow = 20
+$limit = 20
+if (-not $script:start) { $script:start = Get-Date }
 
-if ($null -eq $Global:ScriptFirstRunTime) {
-    $Global:ScriptFirstRunTime = Get-Date
+function Get-Menu {
+    clear
+    ""
+    "  [ USB MONITOR ]"
+    "  ----------------------"
+    "  1. Current USB Activity"
+    "  2. Registry/System Logs"
+    "  3. Process & PS Audit"
+    "  Q. Exit"
+    ""
 }
 
-function Show-Menu {
-    Clear-Host
-    Write-Host "================================" -ForegroundColor Cyan
-    Write-Host "   USB Monitoring Tool" -ForegroundColor Cyan
-    Write-Host "================================" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "1. USB History" -ForegroundColor Green
-    Write-Host "2. USB History AT" -ForegroundColor Magenta
-    Write-Host "3. Powershell Commands" -ForegroundColor Yellow
-    Write-Host "Q. Quit" -ForegroundColor Red
-    Write-Host ""
+function Pause-Menu {
+    write-host "`n[Press BACKSPACE to return]" -f DarkGray
+    while ($true) {
+        $k = [Console]::ReadKey($true)
+        if ($k.Key -eq 'Backspace') { break }
+    }
 }
 
-function Wait-ForBackspace {
-    Write-Host "`nPress BACKSPACE to return to menu..." -ForegroundColor Gray
-    do {
-        $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-    } while ($key.VirtualKeyCode -ne 8)
-}
-
-function Show-USBHistory {
-    Clear-Host
-    $pnpDevices = Get-PnpDevice -Class DiskDrive | Where-Object {$_.Status -eq "OK"}
-    $pnpDevices | Select-Object Status, Class, FriendlyName, InstanceId | Format-Table -AutoSize
+function Get-LiveUSB {
+    clear
+    Get-PnpDevice -Class DiskDrive -Status OK | Select Status, Class, FriendlyName, InstanceId | ft -auto
     
-    Write-Host "=== Active USB Drives & Files (Tracked Since Program Run) ===" -ForegroundColor Green
-    $usbDrives = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object {$_.DriveType -eq 2}
+    write-host ">>> Active Removable Drives (Since: $script:start)" -f Green
+    $drives = Get-CimInstance Win32_LogicalDisk | ? {$_.DriveType -eq 2}
     
-    $sh = New-Object -ComObject WScript.Shell
-    $recentCache = [System.IO.Directory]::GetFiles("$env:APPDATA\Microsoft\Windows\Recent", "*.lnk")
+    if (-not $drives) {
+        write-host "No active USB storage found." -f Yellow
+    } else {
+        $ws = New-Object -ComObject WScript.Shell
+        $lnkFiles = [System.IO.Directory]::GetFiles("$env:APPDATA\Microsoft\Windows\Recent", "*.lnk")
 
-    if ($usbDrives) {
-        foreach ($drive in $usbDrives) {
-            $driveLetter = $drive.DeviceID -replace ":", ""
+        foreach ($d in $drives) {
+            $letter = $d.DeviceID.Replace(":", "")
+            $dlDir = "$HOME\Downloads"
             
-            $treePath = "$HOME\Downloads\Drive_${driveLetter}_Folder_Tree.txt"
-            $filePath = "$HOME\Downloads\Drive_${driveLetter}_File_Paths.txt"
-            $ranPath  = "$HOME\Downloads\Drive_${driveLetter}_Ran_Files.txt"
+            $treeLog = "$dlDir\Drive_${letter}_Folder_Tree.txt"
+            $pathLog = "$dlDir\Drive_${letter}_File_Paths.txt"
+            $execLog = "$dlDir\Drive_${letter}_Ran_Files.txt"
             
-            "=== DIRECTORY TREE FOR DRIVE $($drive.DeviceID) (Tracked Since: $Global:ScriptFirstRunTime) ===" | Out-File $treePath -Force
-            "=== INDIVIDUAL FILE PATHS FOR DRIVE $($drive.DeviceID) (Tracked Since: $Global:ScriptFirstRunTime) ===" | Out-File $filePath -Force
-            "=== FILES RAN/OPENED FROM DRIVE $($drive.DeviceID) (Tracked Since: $Global:ScriptFirstRunTime) ===" | Out-File $ranPath -Force
+            "--- TREE FOR $letter ($script:start) ---" | out-file $treeLog -force
+            "--- PATHS FOR $letter ($script:start) ---" | out-file $pathLog -force
+            "--- EXECUTED FOR $letter ($script:start) ---" | out-file $execLog -force
 
-            Write-Host "`n[Drive $($drive.DeviceID) - $($drive.VolumeName)]" -ForegroundColor Green
-            Write-Host "  -> Extracting Folder Trees to: Downloads\Drive_${driveLetter}_Folder_Tree.txt" -ForegroundColor Gray
-            Write-Host "  -> Extracting File Paths to: Downloads\Drive_${driveLetter}_File_Paths.txt" -ForegroundColor Gray
-            Write-Host "  -> Extracting Ran/Executed Files to: Downloads\Drive_${driveLetter}_Ran_Files.txt" -ForegroundColor Cyan
+            write-host "`nDrive [$($d.DeviceID)] -> $($d.VolumeName)" -f Green
+            write-host "  > Saving tree to: Downloads\Drive_${letter}_Folder_Tree.txt" -f Gray
+            write-host "  > Saving paths to: Downloads\Drive_${letter}_File_Paths.txt" -f Gray
             
-            $allFolders = Get-ChildItem -Path ($drive.DeviceID + "\") -Recurse -Directory -ErrorAction SilentlyContinue
-            $allFiles   = Get-ChildItem -Path ($drive.DeviceID + "\") -Recurse -File -ErrorAction SilentlyContinue
+            $fld = Get-ChildItem ($d.DeviceID + "\") -Recurse -Directory -EA 0
+            $fls = Get-ChildItem ($d.DeviceID + "\") -Recurse -File -EA 0
             
-            $activeFolders = $allFolders | Where-Object { $_.LastWriteTime -ge $Global:ScriptFirstRunTime }
-            $activeFiles   = $allFiles | Where-Object { $_.LastWriteTime -ge $Global:ScriptFirstRunTime -or $_.LastAccessTime -ge $Global:ScriptFirstRunTime }
+            $actFld = $fld | ? { $_.LastWriteTime -ge $script:start }
+            $actFls = $fls | ? { $_.LastWriteTime -ge $script:start -or $_.LastAccessTime -ge $script:start }
             
-            if ($activeFolders) {
-                foreach ($folder in $activeFolders) { $folder.FullName | Out-File $treePath -Append }
-            } else { "No folder structures changed since script launch." | Out-File $treePath -Append }
+            if ($actFld) { $actFld.FullName | out-file $treeLog -append } else { "No structural changes." | out-file $treeLog -append }
+            if ($actFls) { $actFls.FullName | out-file $pathLog -append } else { "No file updates." | out-file $pathLog -append }
 
-            if ($activeFiles) {
-                foreach ($file in $activeFiles) { $file.FullName | Out-File $filePath -Append }
-            } else { "No file paths interacted with since script launch." | Out-File $filePath -Append }
-
-            $ranCounter = 0
-            foreach ($lnk in $recentCache) {
-                $lnkFile = [System.IO.FileInfo]$lnk
-                if ($lnkFile.LastWriteTime -ge $Global:ScriptFirstRunTime) {
+            $ran = 0
+            foreach ($lnk in $lnkFiles) {
+                if ((gi $lnk).LastWriteTime -ge $script:start) {
                     try {
-                        $targetPath = $sh.CreateShortcut($lnkFile.FullName).TargetPath
-                        if ($targetPath -match "^$($drive.DeviceID)") {
-                            $targetPath | Out-File $ranPath -Append
-                            if ($ranCounter++ -lt 15) {
-                                Write-Host "  [RAN/OPENED] -> $targetPath" -ForegroundColor Yellow
-                            }
+                        $tgt = $ws.CreateShortcut($lnk).TargetPath
+                        if ($tgt -like "$($d.DeviceID)*") {
+                            $tgt | out-file $execLog -append
+                            if ($ran++ -lt 15) { write-host "  [OPENED] $tgt" -f Yellow }
                         }
                     } catch {}
                 }
             }
-            if ($ranCounter -eq 0) { "No files were executed or opened from this drive during this session." | Out-File $ranPath -Append }
+            if ($ran -eq 0) { "No files executed." | out-file $execLog -append }
         }
-        Write-Host "`n[✓] All separate drive logs successfully updated in your Downloads folder!" -ForegroundColor Green
-    } else {
-        Write-Host "No active removable USB storage drives are currently plugged in." -ForegroundColor Yellow
+        write-host "`n[+] Local logs dropped in Downloads folder." -f Green
     }
 
-    Write-Host "`n=== USB Connection History (Past 24 Hours) ===" -ForegroundColor Cyan
-    Write-Host ("{0,-22} {1,-10} {2,-5} {3}" -f "TimeCreated", "Event", "ID", "Message") -ForegroundColor White
-    Write-Host ("{0,-22} {1,-10} {2,-5} {3}" -f "-----------", "-----", "--", "-------") -ForegroundColor White
-
-    $24HoursAgo = (Get-Date).AddHours(-24)
-    $events = Get-WinEvent -FilterHashtable @{LogName='System'; ID=20001,20003; StartTime=$24HoursAgo} -ErrorAction SilentlyContinue | Sort-Object TimeCreated
-
+    write-host "`n>>> Connection Log (Past 24h)" -f Cyan
+    $events = Get-WinEvent -FilterHashtable @{LogName='System'; ID=20001,20003; StartTime=(Get-Date).AddHours(-24)} -EA 0 | Sort TimeCreated
+    
     if ($events) {
-        foreach ($evt in $events) {
-            if ($evt.Id -eq 20001) { $status = "Connected"; $rowColor = "Green" } else { $status = "Disconnected"; $rowColor = "Red" }
-            $cleanMsg = $evt.Message -replace "`r`n", " " -replace "`n", " "
-            if ($cleanMsg.Length -gt 60) { $cleanMsg = $cleanMsg.Substring(0, 57) + "..." }
-            Write-Host ("{0,-22} {1,-10} {2,-5} {3}" -f $evt.TimeCreated, $status, $evt.Id, $cleanMsg) -ForegroundColor $rowColor
+        foreach ($e in $events) {
+            $status = if ($e.Id -eq 20001) { "Connected" } else { "Disconnected" }
+            $color = if ($e.Id -eq 20001) { "Green" } else { "Red" }
+            $msg = $e.Message.Replace("`n"," ").Replace("`r","")
+            if ($msg.Length -gt 50) { $msg = $msg.Substring(0,47) + "..." }
+            write-host ("[{0}] {1,-12} ID:{2} - {3}" -f $e.TimeCreated.ToString("HH:mm:ss"), $status, $e.Id, $msg) -f $color
         }
     } else {
-        Write-Host "No USB connection events found in the past 24 hours." -ForegroundColor Yellow
+        write-host "No recent connection logs found." -f Gray
     }
-    
-    Wait-ForBackspace
+    Pause-Menu
 }
 
-function Show-USBHistoryAT {
-    Clear-Host
-    Write-Host "=== All USB Devices Ever Connected (Registry) ===" -ForegroundColor Magenta
+function Get-RegistryUSB {
+    clear
+    write-host ">>> Historical Registry Record (USBSTOR)" -f Magenta
+    $reg = Get-ChildItem HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR -EA 0 | Get-ChildItem -EA 0 | Get-ItemProperty -EA 0
     
-    $usbDevices = Get-ChildItem -Path "HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR" -ErrorAction SilentlyContinue | 
-                  Get-ChildItem -ErrorAction SilentlyContinue | 
-                  Get-ItemProperty -ErrorAction SilentlyContinue
-    
-    if ($usbDevices) {
-        $usbDevices | Select-Object @{Name='Device Name';Expression={$_.FriendlyName}}, 
-                                     @{Name='Serial Number';Expression={$_.PSChildName}},
-                                     @{Name='Last Connected';Expression={
-                                         if ($_.Properties) { [DateTime]::FromFileTime($_.Properties) } else { "Unknown" }
-                                     }} | Where-Object {$_.'Device Name' -ne $null} | Format-Table -AutoSize -Wrap
+    if ($reg) {
+        $reg | ? {$_.FriendlyName} | select @{N='Device';E={$_.FriendlyName}}, @{N='Serial';E={$_.PSChildName}} | ft -auto
     } else {
-        Write-Host "No USB storage devices found in registry." -ForegroundColor Yellow
+        write-host "Registry baseline clear." -f Gray
     }
     
-    Write-Host "`n=== USB Device Installation History (SetupAPI Logs) ===" -ForegroundColor Magenta
-    $setupApiLog = "C:\Windows\INF\setupapi.dev.log"
-    
-    if (Test-Path $setupApiLog) {
-        $logLines = Get-Content $setupApiLog -ErrorAction SilentlyContinue | Select-String -Pattern ">>>  \[Device Install"
-        
-        if ($logLines) {
-            $targetedLogs = $logLines | Select-Object -Last $MaxLogsToShow
-            foreach ($line in $targetedLogs) {
-                $cleanLine = $line.Line -replace ">>>  ", ""
-                Write-Host $cleanLine -ForegroundColor Gray
-            }
+    write-host "`n>>> SetupAPI Installation Logs" -f Magenta
+    $log = "C:\Windows\INF\setupapi.dev.log"
+    if (Test-Path $log) {
+        $lines = Get-Content $log -EA 0 | Select-String -Pattern ">>>  \[Device Install"
+        if ($lines) {
+            $lines | select -last $limit | % { write-host ($_.Line -replace ">>>  ", "") -f Gray }
         } else {
-            Write-Host "No installation events found in the logs." -ForegroundColor Yellow
+            write-host "No setup artifacts found." -f Gray
         }
-    } else {
-        Write-Host "SetupAPI log not found." -ForegroundColor Yellow
     }
-    
-    Wait-ForBackspace
+    Pause-Menu
 }
 
-function Show-PowerShellCommands {
-    Clear-Host
-    Write-Host "=== Powershell Commands Auditing ===" -ForegroundColor Yellow
-    Write-Host "1. Past 12 Hours" -ForegroundColor Green
-    Write-Host "2. Past Week" -ForegroundColor Magenta
-    Write-Host ""
+function Get-AuditPS {
+    clear
+    "=== PowerShell Audit Target ==="
+    "1. Last 12 Hours"
+    "2. Last 7 Days"
+    ""
+    $sub = read-host "Select option"
     
-    $subChoice = Read-Host "Enter your choice"
+    if ($sub -eq '1') { $t = (Get-Date).AddHours(-12) }
+    elseif ($sub -eq '2') { $t = (Get-Date).AddDays(-7) }
+    else { write-host "Aborting."; start-sleep 1; return }
     
-    if ($subChoice -eq '1') {
-        $filterTime = (Get-Date).AddHours(-12)
-        $headerText = "=== USB-Related PowerShell Executions (Past 12 Hours) ==="
-    } elseif ($subChoice -eq '2') {
-        $filterTime = (Get-Date).AddDays(-7)
-        $headerText = "=== USB-Related PowerShell Executions (Past Week) ==="
-    } else {
-        Write-Host "`nInvalid choice. Returning to main menu..." -ForegroundColor Red
-        Start-Sleep -Seconds 2
-        return
-    }
+    clear
+    write-host ">>> Logged Script Blocks (Filtered)" -f Cyan
+    $pattern = 'usb|removable|disk|volume|partition|Get-PnpDevice|Get-Disk|Get-Volume'
     
-    Clear-Host
-    Write-Host $headerText -ForegroundColor Cyan
-    
-    $commands = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-PowerShell/Operational'; ID=4104; StartTime=$filterTime} -ErrorAction SilentlyContinue | 
-    Where-Object {$_.Properties.Value -match 'usb|removable|disk|volume|partition|Get-PnpDevice|Get-Disk|Get-Volume|Get-PhysicalDisk' -and $_.Properties.Value -notmatch 'Get-WinEvent'}
-    
-    if ($commands) {
-        foreach ($cmd in $commands) {
-            Write-Host "`n----------------------------------------" -ForegroundColor Gray
-            Write-Host "Time: $($cmd.TimeCreated)" -ForegroundColor Yellow
-            Write-Host "User: $($cmd.UserId)" -ForegroundColor Yellow
-            Write-Host "Command:" -ForegroundColor Cyan
-            Write-Host $cmd.Properties.Value -ForegroundColor White
+    $events = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-PowerShell/Operational'; ID=4104; StartTime=$t} -EA 0 | 
+              ? {$_.Properties.Value -match $pattern -and $_.Properties.Value -notmatch 'Get-WinEvent'}
+              
+    if ($events) {
+        foreach ($e in $events) {
+            write-host "[$($e.TimeCreated)] User: $($e.UserId)" -f Yellow
+            write-host $e.Properties.Value -f White
+            "------------------------------------"
         }
-    } else { 
-        Write-Host "`nNo USB-related PowerShell commands found for the selected timeframe." -ForegroundColor Yellow 
+    } else {
+        write-host "No matching script patterns found." -f Gray
     }
 
-    Write-Host "`n`n=== Currently Running USB-Related PowerShell Processes ===" -ForegroundColor Green
-    Get-Process -Name powershell*,pwsh* -ErrorAction SilentlyContinue | Where-Object {$_.Id -ne $PID} | 
-    Where-Object {(Get-WmiObject Win32_Process -Filter "ProcessId=$($_.Id)").CommandLine -match 'usb|removable|disk|volume|partition|Get-PnpDevice|Get-Disk|Get-Volume' -and (Get-WmiObject Win32_Process -Filter "ProcessId=$($_.Id)").CommandLine -notmatch 'Format-Table -AutoSize -Wrap'} | 
-    Select-Object ProcessName, Id, StartTime, @{Name='RunningFor';Expression={(Get-Date) - $_.StartTime}}, @{Name='CommandLine';Expression={(Get-WmiObject Win32_Process -Filter "ProcessId=$($_.Id)").CommandLine}} | Format-Table -AutoSize -Wrap
+    write-host "`n>>> Active Monitored Processes" -f Green
+    $procs = Get-CimInstance Win32_Process -Filter "Name like 'powershell%'" | ? {
+        $_.CommandLine -match $pattern -and $_.ProcessId -ne $PID -and $_.CommandLine -notmatch 'ft -auto'
+    }
     
-    Wait-ForBackspace
+    if ($procs) {
+        $procs | select ProcessName, ProcessId, CommandLine | ft -auto
+    } else {
+        write-host "No suspicious live processes." -f Gray
+    }
+    Pause-Menu
 }
 
-do {
-    Show-Menu
-    $choice = Read-Host "Enter your choice"
-    switch ($choice) {
-        '1' { Show-USBHistory }
-        '2' { Show-USBHistoryAT }
-        '3' { Show-PowerShellCommands }
-        'Q' { break }
-        default { Write-Host "`nInvalid choice. Please try again." -ForegroundColor Red; Start-Sleep -Seconds 2 }
+# Controlled loop to handle exit cleanly
+$running = $true
+while ($running) {
+    Get-Menu
+    $opt = (read-host "Choose").ToUpper()
+    switch ($opt) {
+        '1' { Get-LiveUSB }
+        '2' { Get-RegistryUSB }
+        '3' { Get-AuditPS }
+        'Q' { $running = $false }
+        default { write-host "Unknown choice." -f Red; start-sleep 1 }
     }
-} while ($choice -ne 'Q')
+}
