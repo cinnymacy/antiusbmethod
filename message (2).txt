@@ -9,7 +9,7 @@ function Show-MainMenu {
     Write-Output ""
     Write-Output "  [ USB INTERACTION MONITOR ]"
     Write-Output "  --------------------------------"
-    Write-Output "  1. Scan Current USB Activity"
+    Write-Output "  1. Scan USB Activity (Live & Historical)"
     Write-Output "  2. View Registry & SetupAPI Logs"
     Write-Output "  3. Audit PowerShell & Processes"
     Write-Output "  Q. Exit Program"
@@ -29,64 +29,66 @@ function Wait-ForBackspace {
 function Get-LiveUSBActivity {
     Clear-Host
     
-    Write-Host ">>> Scanning system for removable storage devices..." -ForegroundColor Green
+    Write-Host ">>> Scanning system for live hardware..." -ForegroundColor Green
     $UsbDrives = Get-CimInstance Win32_LogicalDisk | Where-Object { $_.DriveType -eq 2 }
+    $OutputDir = "$HOME\Downloads"
     
-    if (-not $UsbDrives) {
-        Write-Host "No active USB storage drives detected. Skipping file inventory." -ForegroundColor Yellow
-    } else {
-        # Display underlying physical hardware info for the connected drives
-        Get-PnpDevice -Class DiskDrive -Status OK | Select-Object Status, Class, FriendlyName, InstanceId | Format-Table -AutoSize
-        
-        # Instantiate COM object to resolve Windows Recent shortcuts (.lnk files)
-        $WshShell = New-Object -ComObject WScript.Shell
-        $RecentFolder = "$env:APPDATA\Microsoft\Windows\Recent"
-        $ShortcutFiles = [System.IO.Directory]::GetFiles($RecentFolder, "*.lnk")
+    # 1. Instantiate the COM shell tool to extract historical file links
+    $WshShell = New-Object -ComObject WScript.Shell
+    $RecentFolder = "$env:APPDATA\Microsoft\Windows\Recent"
+    $ShortcutFiles = [System.IO.Directory]::GetFiles($RecentFolder, "*.lnk")
 
-        # Resolve all shortcuts modified during this active monitoring session
-        Write-Host "Building active session shortcut baseline..." -ForegroundColor Gray
-        $SessionOpenedPaths = @()
-        foreach ($LnkFile in $ShortcutFiles) {
-            $FileInfo = Get-Item $LnkFile -ErrorAction SilentlyContinue
-            if ($FileInfo -and $FileInfo.LastWriteTime -ge $Script:SessionStartTime) {
-                try {
-                    $TargetPath = $WshShell.CreateShortcut($LnkFile).TargetPath
-                    if ($TargetPath) { 
+    Write-Host "Reconstructing file history from system shortcut tracking caches..." -ForegroundColor Gray
+    
+    # Arrays to split live active session vs total historical forensic hits
+    $SessionOpenedPaths = @()
+    $AllHistoricalUsbPaths = @()
+
+    foreach ($LnkFile in $ShortcutFiles) {
+        $FileInfo = Get-Item $LnkFile -ErrorAction SilentlyContinue
+        if ($FileInfo) {
+            try {
+                $TargetPath = $WshShell.CreateShortcut($LnkFile).TargetPath
+                # Match typical removable drive roots (D:\, E:\, F:\ up to Z:\)
+                if ($TargetPath -match '^[D-Z]:\\') {
+                    $AllHistoricalUsbPaths += $TargetPath
+                    
+                    # Track files run specifically since this tool started executing
+                    if ($FileInfo.LastWriteTime -ge $Script:SessionStartTime) {
                         $SessionOpenedPaths += $TargetPath 
                     }
-                } catch {
-                    # Skip broken or restricted shortcuts
                 }
+            } catch {
+                # Bypass unreadable shortcuts
             }
         }
+    }
 
-        # Process each detected USB drive individually
+    # --- CASE A: SYSTEM HAS A LIVE USB ATTACHED ---
+    if ($UsbDrives) {
+        Write-Host "Active hardware discovered. Processing connected media..." -ForegroundColor Green
+        Get-PnpDevice -Class DiskDrive -Status OK | Select-Object Status, Class, FriendlyName, InstanceId | Format-Table -AutoSize
+
         foreach ($Drive in $UsbDrives) {
             $DriveLetter = $Drive.DeviceID.Replace(":", "")
-            $OutputDir = "$HOME\Downloads"
-            
-            # The two original allowed output files
             $FolderTreeLog = "$OutputDir\Drive_${DriveLetter}_Folder_Tree.txt"
             $CombinedFileLog = "$OutputDir\Drive_${DriveLetter}_File_Paths.txt"
             
-            Write-Host "`nProcessing Drive [$($Drive.DeviceID)] -> Target Name: $($Drive.VolumeName)" -ForegroundColor Green
+            Write-Host "`nProcessing Connected Drive [$($Drive.DeviceID)] -> $($Drive.VolumeName)" -ForegroundColor Green
             
-            # 1. File #1: Map the directory architecture
+            # Map directories
             $SubFolders = Get-ChildItem ($Drive.DeviceID + "\") -Recurse -Directory -ErrorAction SilentlyContinue
             if ($SubFolders) {
                 "--- FOLDER STRUCTURAL MAP FOR DRIVE $DriveLetter ---" | Out-File $FolderTreeLog -Force
                 $SubFolders.FullName | Out-File $FolderTreeLog -Append
-                Write-Host "  > Directory structure saved to: Drive_${DriveLetter}_Folder_Tree.txt" -ForegroundColor Gray
             }
             
-            # 2. Inventory all physical files across the drive
+            # Catalog physical storage files
             $AllDriveFiles = Get-ChildItem ($Drive.DeviceID + "\") -Recurse -File -ErrorAction SilentlyContinue
-            
             if ($AllDriveFiles) {
                 $ExecutedItems = @()
                 $IdleItems = @()
 
-                # Separate files into dynamic programmatic lists
                 foreach ($File in $AllDriveFiles) {
                     if ($SessionOpenedPaths -contains $File.FullName) {
                         $ExecutedItems += $File.FullName
@@ -95,39 +97,81 @@ function Get-LiveUSBActivity {
                     }
                 }
 
-                # 3. File #2: Combine lists into a single file with custom divider layout
+                # Construct requested clean output structure
                 Write-Output "In USB:" | Out-File $CombinedFileLog -Force
-                if ($IdleItems.Count -gt 0) {
-                    $IdleItems | Out-File $CombinedFileLog -Append
-                } else {
-                    "(No untouched files found)" | Out-File $CombinedFileLog -Append
-                }
+                if ($IdleItems.Count -gt 0) { $IdleItems | Out-File $CombinedFileLog -Append }
+                else { "(No untouched files found)" | Out-File $CombinedFileLog -Append }
 
-                Write-Output "-------------------------" | Out-File $CombinedFileLog -Append
+                Write-Output "-------------------------" | Out-File $CombinedFileLog -Force
                 Write-Output "Ran from USB:" | Out-File $CombinedFileLog -Append
                 
                 if ($ExecutedItems.Count -gt 0) {
                     $ExecutedItems | Out-File $CombinedFileLog -Append
-                    Write-Host "  > Active file interactions documented inside Drive_${DriveLetter}_File_Paths.txt" -ForegroundColor Cyan
-                    
-                    # Keep live terminal screen updates intact
-                    $PreviewCounter = 0
-                    foreach ($Path in $ExecutedItems) {
-                        if ($PreviewCounter++ -lt 15) { 
-                            Write-Host "  [LIVE INTERACTION] -> $Path" -ForegroundColor Yellow 
-                        }
-                    }
+                    $ExecutedItems | ForEach-Object { Write-Host "  [LIVE INTERACTION] -> $_" -ForegroundColor Yellow }
                 } else {
                     "(No executed files found during this session)" | Out-File $CombinedFileLog -Append
-                    Write-Host "  > No file execution detected from this drive during this session." -ForegroundColor Gray
+                }
+                Write-Host "  > Inventory saved to: Drive_${DriveLetter}_File_Paths.txt" -ForegroundColor Gray
+            }
+        }
+    } 
+    # --- CASE B: FORENSIC FALLBACK (NO USB PLUGGED IN) ---
+    else {
+        Write-Host "No active USB storage drives detected." -ForegroundColor Yellow
+        Write-Host "Parsing system artifacts for prior disconnected device file histories..." -ForegroundColor Cyan
+        
+        if ($AllHistoricalUsbPaths.Count -eq 0) {
+            Write-Host "No historical records of files opened from removable drives found on this machine." -ForegroundColor Gray
+        } else {
+            # Pull system mount events ahead of time to match timestamps against disconnected letters
+            $SystemMountEvents = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Partition/Diagnostic'; ID=1006} -ErrorAction SilentlyContinue
+
+            # Extract unique historical drive letters observed from targeted files
+            $HistoricalDrives = $AllHistoricalUsbPaths | ForEach-Object { $_.Substring(0,1).ToUpper() } | Select-Object -Unique
+
+            foreach ($Letter in $HistoricalDrives) {
+                $CombinedFileLog = "$OutputDir\Drive_${Letter}_File_Paths.txt"
+                
+                # Attempt to isolate the exact last connection time for this specific letter
+                $PluginTimestamp = "Unknown"
+                if ($SystemMountEvents) {
+                    $DriveMatchPattern = "DriveLetter`=\s*\""${Letter}:?\"""
+                    $MatchingEvent = $SystemMountEvents | Where-Object { $_.Message -match $DriveMatchPattern } | Select-Object -First 1
+                    if ($MatchingEvent) {
+                        $PluginTimestamp = $MatchingEvent.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss")
+                    }
                 }
                 
-                Write-Host "  > Comprehensive data inventory saved to: Drive_${DriveLetter}_File_Paths.txt" -ForegroundColor Gray
+                # Fallback if the event log was cleared or aged out
+                if ($PluginTimestamp -eq "Unknown") {
+                    $PluginTimestamp = $Script:SessionStartTime.ToString("yyyy-MM-dd HH:mm:ss")
+                }
+
+                # Isolate historical paths belonging purely to this specific letter root
+                $HistoricalDriveFiles = $AllHistoricalUsbPaths | Where-Object { $_ -like "${Letter}:*" } | Select-Object -Unique
+                
+                # Format to your exact text specifications
+                Write-Output "In USB:" | Out-File $CombinedFileLog -Force
+                Write-Output "From USB plugged in at `"$PluginTimestamp`"" | Out-File $CombinedFileLog -Append
+                Write-Output "-------------------------" | Out-File $CombinedFileLog -Append
+                Write-Output "Ran from USB:" | Out-File $CombinedFileLog -Append
+                
+                if ($HistoricalDriveFiles) {
+                    $HistoricalDriveFiles | Out-File $CombinedFileLog -Append
+                    Write-Host "`nRecovered historical data for disconnected Drive [${Letter}:]" -ForegroundColor Green
+                    Write-Host "  > Saved historical log: Drive_${Letter}_File_Paths.txt" -ForegroundColor Gray
+                    
+                    # Print preview of historical files retrieved
+                    $PreviewCounter = 0
+                    foreach ($Path in $HistoricalDriveFiles) {
+                        if ($PreviewCounter++ -lt 5) { Write-Host "  [HISTORICAL PARSE] -> $Path" -ForegroundColor DarkYellow }
+                    }
+                }
             }
         }
     }
 
-    # Fetch last 24 hours of low-level hardware mounting events
+    # Fetch last 24 hours of low-level hardware mounting events for display
     Write-Host "`n>>> Hardware Connection History (Past 24 Hours)" -ForegroundColor Cyan
     $LogCutoffTime = (Get-Date).AddHours(-24)
     $MountEvents = Get-WinEvent -FilterHashtable @{
