@@ -307,5 +307,3 @@ while ($Running) {
         }
     }
 }
-
-
