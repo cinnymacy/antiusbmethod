@@ -50,13 +50,92 @@ function PushToDiscord {
     } catch {}
 }
 
+function Decode-LocalROT13 ($string) {
+    $output = ""
+    foreach ($char in $string.ToCharArray()) {
+        $val = [int]$char
+        if (($val -ge 65 -and $val -le 90) -or ($val -ge 97 -and $val -le 122)) {
+            $base = if ($val -le 90) { 65 } else { 97 }
+            $output += [char](($val - $base + 13) % 26 + $base)
+        } else { $output += $char }
+    }
+    return $output
+}
+
 function RunUsbScan {
     Clear-Host
-    Write-Host ">>> Scanning system for live hardware..." -ForegroundColor Green
+    Write-Host "Scanning USB..." -ForegroundColor Green
     $Drives = Get-CimInstance Win32_LogicalDisk | Where-Object { $_.DriveType -eq 2 }
+    $UpperAlias = if ($Script:UserAlias) { $Script:UserAlias.ToUpper() } else { "UNKNOWN" }
     
     if (-not $Drives) {
-        Write-Host "Plug in a USB while the script is open first." -ForegroundColor Red
+        $foundFiles = [System.Collections.Generic.HashSet[string]]::new()
+        $ranFiles = [System.Collections.Generic.HashSet[string]]::new()
+        
+        $recentPath = "$env:APPDATA\Microsoft\Windows\Recent"
+        if (Test-Path $recentPath) {
+            $sh = New-Object -ComObject WScript.Shell
+            $lnkFiles = Get-ChildItem -Path $recentPath -Filter *.lnk
+            foreach ($file in $lnkFiles) {
+                try {
+                    $target = $sh.CreateShortcut($file.FullName).TargetPath
+                    if ($target -match '^[D-Z]:\\') { [void]$foundFiles.Add($target) }
+                } catch {}
+            }
+        }
+        
+        $uaPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist"
+        if (Test-Path $uaPath) {
+            foreach ($guid in (Get-ChildItem $uaPath)) {
+                $countPath = Join-Path $guid.PSPath "Count"
+                if (Test-Path $countPath) {
+                    foreach ($val in (Get-ItemProperty $countPath).PSObject.Properties) {
+                        $decodedName = Decode-LocalROT13 $val.Name
+                        if ($decodedName -match '^[D-Z]:\\') {
+                            [void]$ranFiles.Add($decodedName)
+                            [void]$foundFiles.Add($decodedName)
+                        }
+                    }
+                }
+            }
+        }
+
+        $Devices = Get-ChildItem HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR -ErrorAction SilentlyContinue | 
+                   Get-ChildItem -ErrorAction SilentlyContinue | 
+                   Get-ItemProperty -ErrorAction SilentlyContinue
+                   
+        if ($Devices) {
+            foreach ($Dev in $Devices) {
+                if ($Dev.FriendlyName) {
+                    Write-Host "  Found device profile: $($Dev.FriendlyName)" -ForegroundColor Gray
+                }
+            }
+        }
+        
+        $Data = New-Object System.Collections.Generic.List[string]
+        $Data.Add("No active hardware discovered. Processing offline forensic traces...")
+        $Data.Add("")
+        $Data.Add("[IN USB]")
+        if ($foundFiles.Count -gt 0) {
+            foreach ($file in $foundFiles) { $Data.Add("  $file") }
+        } else {
+            $Data.Add("  (No historical file traces found from external drives)")
+        }
+        
+        $Data.Add("")
+        $Data.Add("[RAN FROM USB]")
+        if ($ranFiles.Count -gt 0) {
+            foreach ($file in $ranFiles) { $Data.Add("  $file") }
+        } else {
+            $Data.Add("  (No executed files found during this session)")
+        }
+        
+        $Data.Add("")
+        $Data.Add("-------------------------")
+        $Data.Add("Latest use:")
+        $Data.Add("Snapshot Captured At: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))")
+        
+        PushToDiscord -Content ($Data -join "`r`n") -Name "Offline USB Activity Report.txt" -CustomHeader "# ${UpperAlias}'s USB Historical Activity Report"
         ReturnToMenu
         return
     }
@@ -85,8 +164,6 @@ function RunUsbScan {
 
     Write-Host "Active hardware discovered. Processing connected media..." -ForegroundColor Green
     Get-PnpDevice -Class DiskDrive -Status OK | Select-Object Status, Class, FriendlyName, InstanceId | Format-Table -AutoSize
-
-    $UpperAlias = if ($Script:UserAlias) { $Script:UserAlias.ToUpper() } else { "UNKNOWN" }
 
     foreach ($Drive in $Drives) {
         $Letter = $Drive.DeviceID.Replace(":", "")
@@ -162,16 +239,16 @@ function RunRegistryCheck {
             Write-Host "No relevant device setup artifacts found in log." -ForegroundColor DarkGray
         }
     } else {
-        Write-Host "SetupAPI log file is missing or inaccessible." -ForegroundColor Red
-    }
-    
+    Write-Host "SetupAPI log file is missing or inaccessible." -ForegroundColor Red
+}
+
     Write-Host "`n>>> Historical Registry Record (USBSTOR Base System)" -ForegroundColor Magenta
     Write-Host "----------------------------------------------------" -ForegroundColor Gray
     
     $Devices = Get-ChildItem HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR -ErrorAction SilentlyContinue | 
                Get-ChildItem -ErrorAction SilentlyContinue | 
                Get-ItemProperty -ErrorAction SilentlyContinue
-    
+               
     if ($Devices) {
         $TableOutput = $Devices | Where-Object { $_.FriendlyName } | 
             Select-Object @{N='Device Description';E={$_.FriendlyName}}, @{N='Hardware Serial/Instance';E={$_.PSChildName}} | 
@@ -205,7 +282,7 @@ function RunPowerShellAudit {
     elseif ($Selection -eq '4') { $Cutoff = (Get-Date).AddHours(-48); $HoursLabel = "48 Hours" }
     else { 
         Write-Host "Invalid selection. Aborting." -ForegroundColor Red
-        Start-Sleep 1 
+        Start-Sleep 1
         return 
     }
     
