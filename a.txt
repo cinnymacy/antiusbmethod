@@ -4,7 +4,7 @@
 # ============================================================
 
 $LogCount = 20
-$Webhook  = "https://discord.com/api/webhooks/1506544571192967208/wE3c-NSO8MbovaNwFpIPhRDvriwYmqMEEskKALyvzEQcUwpgSXmq84p0qzDFAgWTzHPE"
+$Webhook  = " "
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
