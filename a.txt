@@ -1,9 +1,18 @@
 $LogCount = 20
-$Webhook = "https://discord.com/api/webhooks/1506544571192967208/wE3c-NSO8MbovaNwFpIPhRDvriwYmqMEEskKALyvzEQcUwpgSXmq84p0qzDFAgWTzHPE"
+$Webhook  = "PASTE_NEW_WEBHOOK_URL_HERE"   # regenerate the old one, it was exposed
 
-if (-not $Script:SessionStartTime) { 
-    $Script:SessionStartTime = Get-Date 
+if (-not $Script:SessionStartTime) { $Script:SessionStartTime = Get-Date }
+
+$IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not ('Win32Util.Dos' -as [type])) {
+    Add-Type -Namespace Win32Util -Name Dos -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern uint QueryDosDevice(string lpDeviceName, System.Text.StringBuilder lpTargetPath, int ucchMax);
+'@
 }
+
+# ---------------------------------------------------------------- helpers
 
 function ShowMenu {
     Clear-Host
@@ -15,6 +24,9 @@ function ShowMenu {
     Write-Output "  3. Powershell History"
     Write-Output "  4. Set User Alias"
     Write-Output "  Q. Exit Program"
+    if (-not $IsAdmin) {
+        Write-Host "`n  (Not elevated: BAM and some registry data will be missing. Run as admin.)" -ForegroundColor DarkYellow
+    }
     Write-Output ""
 }
 
@@ -25,14 +37,20 @@ function ReturnToMenu {
     }
 }
 
+function Fmt($d) { if ($d) { $d.ToString('yyyy-MM-dd HH:mm:ss') } else { 'unknown' } }
+
 function PushToDiscord {
     param ($Content, $Name, $CustomHeader)
+    if ($Webhook -like 'PASTE*') {
+        Write-Host "`nNo webhook set, report not sent." -ForegroundColor DarkYellow
+        return
+    }
     try {
         $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Content)
         $Payload = [System.Text.Encoding]::GetEncoding("iso-8859-1").GetString($Bytes)
         $Boundary = [System.Guid]::NewGuid().ToString()
         $LineBreak = "`r`n"
-        
+
         $FormConfig = (
             "--$Boundary",
             "Content-Disposition: form-data; name=`"content`"",
@@ -47,147 +65,251 @@ function PushToDiscord {
         )
         $DataBuffer = [System.Text.Encoding]::GetEncoding("iso-8859-1").GetBytes(($FormConfig -join $LineBreak))
         Invoke-RestMethod -Uri $Webhook -Method Post -ContentType "multipart/form-data; boundary=$Boundary" -Body $DataBuffer | Out-Null
-    } catch {}
+    } catch {
+        Write-Host "`nDiscord upload failed: $($_.Exception.Message)" -ForegroundColor Red
+    }
 }
+
+# ---------------------------------------------------------------- tree helpers
+
+function New-TreeNode {
+    @{
+        Kids   = New-Object 'System.Collections.Generic.SortedDictionary[string,object]' ([System.StringComparer]::OrdinalIgnoreCase)
+        Opened = $null
+        Ran    = $null
+    }
+}
+
+function Add-ToTree {
+    param($Root, [string]$Path, $Kind, $Time)
+    $node = $Root
+    foreach ($p in ($Path -split '\\' | Where-Object { $_ })) {
+        if (-not $node.Kids.ContainsKey($p)) { $node.Kids[$p] = New-TreeNode }
+        $node = $node.Kids[$p]
+    }
+    if ($Kind -and (-not $node[$Kind] -or $Time -gt $node[$Kind])) { $node[$Kind] = $Time }
+}
+
+function Write-TreeNode {
+    param($Node, [string]$Prefix, $Lines)
+    $keys = @($Node.Kids.Keys)
+    for ($i = 0; $i -lt $keys.Count; $i++) {
+        $child  = $Node.Kids[$keys[$i]]
+        $isLast = ($i -eq $keys.Count - 1)
+        $branch = if ($isLast) { '\-- ' } else { '+-- ' }
+
+        $tags = @()
+        if ($child.Opened) { $tags += "opened " + (Fmt $child.Opened) }
+        if ($child.Ran)    { $tags += "ran "    + (Fmt $child.Ran) }
+        $live = ($child.Opened -and $child.Opened -ge $Script:SessionStartTime) -or
+                ($child.Ran    -and $child.Ran    -ge $Script:SessionStartTime)
+        $stamp = if ($tags.Count) { '  <- ' + ($tags -join ' | ') + $(if ($live) { ' [THIS SESSION]' } else { '' }) } else { '' }
+
+        $Lines.Add($Prefix + $branch + $keys[$i] + $stamp)
+        $ext = if ($isLast) { '    ' } else { '|   ' }
+        Write-TreeNode $child ($Prefix + $ext) $Lines
+    }
+}
+
+function Get-VolumeMap {
+    $map = @{}
+    foreach ($d in (Get-CimInstance Win32_LogicalDisk)) {
+        $sb = New-Object System.Text.StringBuilder 512
+        [void][Win32Util.Dos]::QueryDosDevice($d.DeviceID, $sb, 512)
+        if ($sb.Length -gt 0) { $map[$sb.ToString()] = $d }
+    }
+    $map
+}
+
+function Get-UsbKeyTime {
+    param($KeyPath, $Id)
+    try {
+        $p = Get-ItemProperty -LiteralPath "$KeyPath\Properties\{83da6326-97a6-4088-9453-a1923f573b29}\$Id" -ErrorAction Stop
+        $b = $p.'(default)'
+        if ($b -is [byte[]] -and $b.Length -ge 8) {
+            return [DateTime]::FromFileTime([BitConverter]::ToInt64($b, 0))
+        }
+    } catch {}
+    return $null
+}
+
+# ---------------------------------------------------------------- 1. scan
 
 function RunUsbScan {
     Clear-Host
-    Write-Host ">>> Scanning system for live hardware..." -ForegroundColor Green
-    $Drives = Get-CimInstance Win32_LogicalDisk | Where-Object { $_.DriveType -eq 2 }
-    
-    if (-not $Drives) {
-        Write-Host "Plug in a USB while the script is open first." -ForegroundColor Red
-        ReturnToMenu
-        return
-    }
-
-    $Shell = New-Object -ComObject WScript.Shell
-    $RecentPath = "$env:APPDATA\Microsoft\Windows\Recent"
-    $Shortcuts = [System.IO.Directory]::GetFiles($RecentPath, "*.lnk")
-    
-    $CurrentSessionFiles = @()
-    $AllHistoricalUsbPaths = @()
-
-    foreach ($Link in $Shortcuts) {
-        $Info = Get-Item $Link -ErrorAction SilentlyContinue
-        if ($Info) {
-            try {
-                $PathTarget = $Shell.CreateShortcut($Link).TargetPath
-                if ($PathTarget -match '^[D-Z]:\\') {
-                    $AllHistoricalUsbPaths += $PathTarget
-                    if ($Info.LastWriteTime -ge $Script:SessionStartTime) {
-                        $CurrentSessionFiles += $PathTarget 
-                    }
-                }
-            } catch {}
-        }
-    }
-
-    Write-Host "Active hardware discovered. Processing connected media..." -ForegroundColor Green
-    Get-PnpDevice -Class DiskDrive -Status OK | Select-Object Status, Class, FriendlyName, InstanceId | Format-Table -AutoSize
+    Write-Host ">>> Collecting USB artifacts..." -ForegroundColor Green
 
     $UpperAlias = if ($Script:UserAlias) { $Script:UserAlias.ToUpper() } else { "UNKNOWN" }
+    $AllDisks   = @(Get-CimInstance Win32_LogicalDisk)
+    $FixedIDs   = @($AllDisks | Where-Object { $_.DriveType -eq 3 } | ForEach-Object { $_.DeviceID })
+    $Removable  = @($AllDisks | Where-Object { $_.DriveType -eq 2 })
+    $VolMap     = Get-VolumeMap
 
-    foreach ($Drive in $Drives) {
-        $Letter = $Drive.DeviceID.Replace(":", "")
-        Write-Host "`nProcessing Connected Drive [$($Drive.DeviceID)] -> $($Drive.VolumeName)" -ForegroundColor Green
-        
-        $Files = Get-ChildItem ($Drive.DeviceID + "\") -Recurse -File -ErrorAction SilentlyContinue
-        if ($Files) {
-            $RunItems = @()
-            $IdleItems = @()
+    $Root = New-TreeNode
+    $OpenedCount = 0
+    $RanCount    = 0
 
-            foreach ($File in $Files) {
-                if ($CurrentSessionFiles -contains $File.FullName) { $RunItems += $File.FullName } 
-                else { $IdleItems += $File.FullName }
+    # --- Recent shortcuts (survive unplugging) ---
+    $Shell  = New-Object -ComObject WScript.Shell
+    $Recent = "$env:APPDATA\Microsoft\Windows\Recent"
+    foreach ($Link in (Get-ChildItem $Recent -Filter *.lnk -ErrorAction SilentlyContinue)) {
+        try {
+            $T = $Shell.CreateShortcut($Link.FullName).TargetPath
+            if ($T -match '^([D-Z]:)\\' -and $FixedIDs -notcontains $Matches[1]) {
+                Add-ToTree $Root $T 'Opened' $Link.LastWriteTime
+                $OpenedCount++
             }
+        } catch {}
+    }
 
-            $Data = New-Object System.Collections.Generic.List[string]
-            $Data.Add("In USB:")
-            
-            Write-Host "`n[IN USB]" -ForegroundColor Gray
-            if ($IdleItems.Count -gt 0) { 
-                $IdleItems | ForEach-Object { $Data.Add($_); Write-Host "  $_" -ForegroundColor Gray } 
-            } else { 
-                $Data.Add("(No untouched files found)")
-                Write-Host "  (No untouched files found)" -ForegroundColor DarkGray
+    # --- BAM (executables run, needs admin) ---
+    $BamRoots = @(
+        'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings',
+        'HKLM:\SYSTEM\CurrentControlSet\Services\bam\UserSettings'
+    )
+    foreach ($BamRoot in $BamRoots) {
+        foreach ($Sid in (Get-ChildItem $BamRoot -ErrorAction SilentlyContinue)) {
+            foreach ($Name in $Sid.GetValueNames()) {
+                $Raw = $Sid.GetValue($Name)
+                if (-not ($Raw -is [byte[]]) -or $Raw.Length -lt 8) { continue }
+                $Time = [DateTime]::FromFileTimeUtc([BitConverter]::ToInt64($Raw, 0)).ToLocalTime()
+                $Path = $null
+
+                if ($Name -match '^(\\Device\\HarddiskVolume\d+)(\\.*)$') {
+                    $Vol = $Matches[1]; $Rest = $Matches[2]
+                    if ($VolMap.ContainsKey($Vol)) {
+                        $Disk = $VolMap[$Vol]
+                        if ($Disk.DriveType -ne 3) { $Path = $Disk.DeviceID + $Rest }
+                    } else {
+                        $Path = '[' + ($Vol -replace '^\\Device\\', '') + ' - not mounted]' + $Rest
+                    }
+                } elseif ($Name -match '^([D-Z]:)\\' -and $FixedIDs -notcontains $Matches[1]) {
+                    $Path = $Name
+                }
+
+                if ($Path) { Add-ToTree $Root $Path 'Ran' $Time; $RanCount++ }
             }
-
-            $Data.Add("-------------------------")
-            $Data.Add("Ran from USB:")
-            
-            Write-Host "`n[RAN FROM USB]" -ForegroundColor Yellow
-            if ($RunItems.Count -gt 0) { 
-                $RunItems | ForEach-Object { $Data.Add($_); Write-Host "  [LIVE INTERACTION] -> $_" -ForegroundColor Yellow } 
-            } else { 
-                $Data.Add("(No executed files found during this session)")
-                Write-Host "  (No executed files found during this session)" -ForegroundColor DarkGray
-            }
-
-            $Data.Add("-------------------------")
-            $Data.Add("Latest use:")
-            $Data.Add("Snapshot Captured At: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))")
-            $Data.Add("=========================================================")
-            
-            Write-Host "`n[LATEST USE TREE]" -ForegroundColor Cyan
-            $Tree = tree ($Drive.DeviceID + "\") /A /F
-            if ($Tree) {
-                $Tree | ForEach-Object { $Data.Add($_); Write-Host $_ -ForegroundColor Cyan }
-            }
-
-            PushToDiscord -Content ($Data -join "`r`n") -Name "USB Activity Report.txt" -CustomHeader "# ${UpperAlias}'s USB Activity Report"
         }
     }
+
+    # --- Full listing of any connected removable drive, merged into the same tree ---
+    foreach ($Drive in $Removable) {
+        foreach ($Item in (Get-ChildItem ($Drive.DeviceID + '\') -Recurse -Force -ErrorAction SilentlyContinue)) {
+            Add-ToTree $Root $Item.FullName $null $null
+        }
+    }
+
+    # --- Render ---
+    $Lines = New-Object System.Collections.Generic.List[string]
+    Write-TreeNode $Root '' $Lines
+
+    $Data = New-Object System.Collections.Generic.List[string]
+    $Data.Add("=== File tree: opened / run from external drives ===")
+    $Data.Add("Entries marked '<-' were opened (Recent shortcut) or run (BAM), with last time seen.")
+    $Data.Add("Opened: $OpenedCount  |  Ran: $RanCount  |  Elevated: $IsAdmin")
+    if ($Removable) {
+        $Data.Add("Connected now: " + (($Removable | ForEach-Object { "$($_.DeviceID) $($_.VolumeName)" }) -join ', '))
+    } else {
+        $Data.Add("Connected now: none (only touched paths are listed)")
+    }
+    $Data.Add("-------------------------")
+
+    Write-Host "`n[OPENED / RAN FROM EXTERNAL DRIVES]" -ForegroundColor Cyan
+    Write-Host "Opened: $OpenedCount  |  Ran: $RanCount" -ForegroundColor Gray
+    if (-not $IsAdmin) { Write-Host "Not elevated, BAM (ran) data unavailable." -ForegroundColor DarkYellow }
+
+    if ($Lines.Count -eq 0) {
+        $Data.Add("(nothing found)")
+        Write-Host "  (nothing found)" -ForegroundColor DarkGray
+    } else {
+        foreach ($L in $Lines) {
+            $Data.Add($L)
+            $Color = if ($L -like '*<- *') { 'Yellow' } else { 'Gray' }
+            Write-Host $L -ForegroundColor $Color
+        }
+    }
+
+    $Data.Add("-------------------------")
+    $Data.Add("Snapshot Captured At: $(Fmt (Get-Date))")
+
+    PushToDiscord -Content ($Data -join "`r`n") -Name "USB Activity Report.txt" -CustomHeader "# ${UpperAlias}'s USB Activity Report"
     ReturnToMenu
 }
 
+# ---------------------------------------------------------------- 2. view usbs
+
 function RunRegistryCheck {
     Clear-Host
-    Write-Host ">>> Hardware Installation History (SetupAPI Logs)" -ForegroundColor Magenta
-    Write-Host "----------------------------------------------------" -ForegroundColor Gray
-    
     $Data = New-Object System.Collections.Generic.List[string]
-    $Data.Add(">>> Historical Registry Record (USBSTOR Base System)")
+
+    Write-Host ">>> Recent USB device installs (SetupAPI log)" -ForegroundColor Magenta
+    Write-Host "----------------------------------------------------" -ForegroundColor Gray
+    $Data.Add(">>> Recent USB device installs (SetupAPI log)")
     $Data.Add("----------------------------------------------------")
-    
+
     $SetupLog = "C:\Windows\INF\setupapi.dev.log"
     if (Test-Path $SetupLog) {
-        $Matches = Get-Content $SetupLog -ErrorAction SilentlyContinue | Select-String -Pattern ">>>  \[Device Install"
-        if ($Matches) {
-            $TargetLines = $Matches | Select-Object -Last $LogCount
-            foreach ($Line in $TargetLines) {
-                Write-Host ($Line.Line -replace ">>>  ", "") -ForegroundColor Gray
+        $SetupHits = Select-String -Path $SetupLog -Pattern '>>>  \[Device Install.*(USB|STORAGE)' -Context 0,1
+        if ($SetupHits) {
+            foreach ($Hit in ($SetupHits | Select-Object -Last $LogCount)) {
+                $When = if ($Hit.Context.PostContext.Count) {
+                    ($Hit.Context.PostContext[0] -replace '^>>>\s+Section start\s+', '').Trim()
+                } else { '' }
+                $Line = ("$When  " + ($Hit.Line -replace '^>>>\s+', '')).Trim()
+                $Data.Add($Line)
+                Write-Host $Line -ForegroundColor Gray
             }
         } else {
-            Write-Host "No relevant device setup artifacts found in log." -ForegroundColor DarkGray
+            $Data.Add("No relevant device setup entries found.")
+            Write-Host "No relevant device setup entries found." -ForegroundColor DarkGray
         }
     } else {
-        Write-Host "SetupAPI log file is missing or inaccessible." -ForegroundColor Red
+        $Data.Add("SetupAPI log missing or inaccessible.")
+        Write-Host "SetupAPI log missing or inaccessible." -ForegroundColor Red
     }
-    
-    Write-Host "`n>>> Historical Registry Record (USBSTOR Base System)" -ForegroundColor Magenta
+
+    Write-Host "`n>>> Historical USB device inventory (USBSTOR)" -ForegroundColor Magenta
     Write-Host "----------------------------------------------------" -ForegroundColor Gray
-    
-    $Devices = Get-ChildItem HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR -ErrorAction SilentlyContinue | 
-               Get-ChildItem -ErrorAction SilentlyContinue | 
-               Get-ItemProperty -ErrorAction SilentlyContinue
-    
-    if ($Devices) {
-        $TableOutput = $Devices | Where-Object { $_.FriendlyName } | 
-            Select-Object @{N='Device Description';E={$_.FriendlyName}}, @{N='Hardware Serial/Instance';E={$_.PSChildName}} | 
-            Format-Table -AutoSize | Out-String
-            
-        $Data.Add($TableOutput)
-        Write-Output $TableOutput
-    } else {
-        $Data.Add("USBSTOR Registry baseline completely clear.")
-        Write-Host "USBSTOR Registry baseline completely clear." -ForegroundColor DarkGray
+    $Data.Add("")
+    $Data.Add(">>> Historical USB device inventory (USBSTOR)")
+    $Data.Add("----------------------------------------------------")
+
+    $Rows = foreach ($Class in (Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR' -ErrorAction SilentlyContinue)) {
+        foreach ($Key in (Get-ChildItem -LiteralPath $Class.PSPath -ErrorAction SilentlyContinue)) {
+            $Props = Get-ItemProperty -LiteralPath $Key.PSPath -ErrorAction SilentlyContinue
+            $Desc = if ($Props.FriendlyName) { $Props.FriendlyName }
+                    elseif ($Props.DeviceDesc) { ($Props.DeviceDesc -split ';')[-1] }
+                    else { 'N/A' }
+            [pscustomobject]@{
+                Device       = $Desc
+                Serial       = $Key.PSChildName
+                FirstInstall = Get-UsbKeyTime $Key.PSPath '0064'
+                LastArrival  = Get-UsbKeyTime $Key.PSPath '0066'
+                LastRemoval  = Get-UsbKeyTime $Key.PSPath '0067'
+            }
+        }
     }
-    
+
+    if ($Rows) {
+        $Table = @($Rows) | Sort-Object LastArrival -Descending | Select-Object `
+            Device, Serial,
+            @{N='First Install'; E={ Fmt $_.FirstInstall }},
+            @{N='Last Arrival';  E={ Fmt $_.LastArrival }},
+            @{N='Last Removal';  E={ Fmt $_.LastRemoval }} |
+            Format-Table -AutoSize | Out-String -Width 250
+        $Data.Add($Table)
+        Write-Host $Table
+    } else {
+        $Data.Add("USBSTOR registry baseline is empty.")
+        Write-Host "USBSTOR registry baseline is empty." -ForegroundColor DarkGray
+    }
+
     $UpperAlias = if ($Script:UserAlias) { $Script:UserAlias.ToUpper() } else { "UNKNOWN" }
     PushToDiscord -Content ($Data -join "`r`n") -Name "Historical Registry Record.txt" -CustomHeader "# ${UpperAlias}'s USB History Report"
     ReturnToMenu
 }
+
+# ---------------------------------------------------------------- 3. powershell history
 
 function RunPowerShellAudit {
     Clear-Host
@@ -198,65 +320,65 @@ function RunPowerShellAudit {
     Write-Output "4. Past 48 Hours"
     Write-Output ""
     $Selection = Read-Host "Select timeframe option"
-    
-    if ($Selection -eq '1') { $Cutoff = (Get-Date).AddHours(-1); $HoursLabel = "1 Hour" }
+
+    if     ($Selection -eq '1') { $Cutoff = (Get-Date).AddHours(-1);  $HoursLabel = "1 Hour" }
     elseif ($Selection -eq '2') { $Cutoff = (Get-Date).AddHours(-12); $HoursLabel = "12 Hours" }
     elseif ($Selection -eq '3') { $Cutoff = (Get-Date).AddHours(-24); $HoursLabel = "24 Hours" }
     elseif ($Selection -eq '4') { $Cutoff = (Get-Date).AddHours(-48); $HoursLabel = "48 Hours" }
-    else { 
+    else {
         Write-Host "Invalid selection. Aborting." -ForegroundColor Red
-        Start-Sleep 1 
-        return 
+        Start-Sleep 1
+        return
     }
-    
+
     Clear-Host
     Write-Host ">>> Unfiltered PowerShell Script Execution Log" -ForegroundColor Cyan
     Write-Host "Timeframe Window Triggered: $Cutoff" -ForegroundColor Gray
     Write-Host "----------------------------------------------------" -ForegroundColor Gray
-    
+
     $Data = New-Object System.Collections.Generic.List[string]
     $Data.Add(">>> Unfiltered PowerShell Script Execution Log")
     $Data.Add("Timeframe Window Triggered: $Cutoff")
     $Data.Add("----------------------------------------------------")
-    
+
     $Events = Get-WinEvent -FilterHashtable @{
         LogName   = 'Microsoft-Windows-PowerShell/Operational'
         ID        = 4104
         StartTime = $Cutoff
     } -ErrorAction SilentlyContinue
-              
+
     if ($Events) {
-        $Deduper = @{}
-        foreach ($Event in $Events) {
-            $ScriptText = $Event.Properties.Value
+        $Deduper = [ordered]@{}
+        foreach ($Ev in $Events) {
+            $ScriptText = $Ev.Properties[2].Value     # ScriptBlockText
             if (-not [string]::IsNullOrWhiteSpace($ScriptText)) {
-                if (-not $Deduper.ContainsKey($ScriptText)) {
+                if (-not $Deduper.Contains($ScriptText)) {
                     $Deduper[$ScriptText] = New-Object System.Collections.Generic.List[string]
                 }
-                $Deduper[$ScriptText].Add($Event.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss"))
+                $Deduper[$ScriptText].Add($Ev.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss"))
             }
         }
 
         foreach ($Key in $Deduper.Keys) {
             $Timestamps = $Deduper[$Key]
             $Count = $Timestamps.Count
-            
+
             $ScriptHeader = if ($Count -gt 1) {
                 "$Key (x$Count ($($Timestamps -join ', ')))"
             } else {
-                "[$($Timestamps)] $Key"
+                "[$($Timestamps[0])] $Key"
             }
 
             $Data.Add($ScriptHeader)
             $Data.Add("----------------------------------------------------")
             $Data.Add("`r`n`r`n`r`n")
-            
+
             Write-Host $ScriptHeader -ForegroundColor White
             Write-Host "----------------------------------------------------" -ForegroundColor Gray
         }
     } else {
-        $Data.Add("No recorded PowerShell execution block log artifacts discovered in this timeframe.")
-        Write-Host "No recorded PowerShell execution block log artifacts discovered in this timeframe." -ForegroundColor DarkGray
+        $Data.Add("No recorded PowerShell script block log entries in this timeframe.")
+        Write-Host "No recorded PowerShell script block log entries in this timeframe." -ForegroundColor DarkGray
     }
 
     $Data.Add("`r`n----------------------------------------------------")
@@ -266,22 +388,24 @@ function RunPowerShellAudit {
     Write-Host "`n>>> Active Memory Monitoring Process State Scan" -ForegroundColor Green
     Write-Host "----------------------------------------------------" -ForegroundColor Gray
 
-    $Processes = Get-CimInstance Win32_Process -Filter "Name like 'powershell%'" | 
+    $Processes = Get-CimInstance Win32_Process -Filter "Name like 'powershell%'" |
                  Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -notmatch 'ft -auto' }
-    
+
     if ($Processes) {
-        $TableOutput = $Processes | Select-Object ProcessName, ProcessId, CommandLine | Format-Table -AutoSize | Out-String
+        $TableOutput = $Processes | Select-Object ProcessName, ProcessId, CommandLine | Format-Table -AutoSize | Out-String -Width 250
         $Data.Add($TableOutput)
         Write-Output $TableOutput
     } else {
-        $Data.Add("No operational background PowerShell instances located in active execution space.")
-        Write-Host "No operational background PowerShell instances located in active execution space." -ForegroundColor DarkGray
+        $Data.Add("No other PowerShell instances running.")
+        Write-Host "No other PowerShell instances running." -ForegroundColor DarkGray
     }
 
     $UpperAlias = if ($Script:UserAlias) { $Script:UserAlias.ToUpper() } else { "UNKNOWN" }
     PushToDiscord -Content ($Data -join "`r`n") -Name "$HoursLabel Powershell Report.txt" -CustomHeader "# ${UpperAlias}'s $HoursLabel Powershell History Report"
     ReturnToMenu
 }
+
+# ---------------------------------------------------------------- 4. alias
 
 function SetUserAlias {
     Clear-Host
@@ -290,52 +414,22 @@ function SetUserAlias {
     ReturnToMenu
 }
 
+# ---------------------------------------------------------------- main loop
+
 $Running = $true
 while ($Running) {
     ShowMenu
     $Choice = (Read-Host "Choose option").ToUpper()
-    
+
     switch ($Choice) {
         '1' { RunUsbScan }
         '2' { RunRegistryCheck }
         '3' { RunPowerShellAudit }
         '4' { SetUserAlias }
         'Q' { $Running = $false }
-        Default { 
+        Default {
             Write-Host "Invalid selection. Try again." -ForegroundColor Red
-            Start-Sleep 1 
+            Start-Sleep 1
         }
     }
-}
-
-$RegistryPath = "HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR"
-
-if (Test-Path $RegistryPath) {
-    Write-Host "=== Historical USB Device Inventory ===" -ForegroundColor Cyan
-    $DeviceClasses = Get-ChildItem -Path $RegistryPath
-
-    foreach ($Class in $DeviceClasses) {
-        $SerialKeys = Get-ChildItem -Path $Class.PSPath
-
-        foreach ($Key in $SerialKeys) {
-            $FriendlyName = Get-ItemProperty -Path $Key.PSPath -Name "FriendlyName" -ErrorAction SilentlyContinue
-            $DeviceDesc   = Get-ItemProperty -Path $Key.PSPath -Name "DeviceDesc" -ErrorAction SilentlyContinue
-
-            $RegKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SYSTEM\CurrentControlSet\Enum\USBSTOR$($Class.PSChildName)$($Key.PSChildName)")
-            $LastWriteTime = $null
-            if ($RegKey) {
-                $LastWriteTime = (New-Object -TypeName string[] -ArgumentList 1 | %{ $RegKey.GetType().GetMethod('GetLastWriteTime').Invoke($RegKey, $null) })
-                $RegKey.Close()
-            }
-
-            [pscustomobject]@{
-                "Device Identifier" = $Class.PSChildName
-                "Serial Number"     = $Key.PSChildName
-                "Friendly Name"     = if ($FriendlyName) { $FriendlyName.FriendlyName } else { "N/A" }
-                "Last Interaction"  = if ($LastWriteTime) { $LastWriteTime } else { "Unknown" }
-            } | Format-List
-        }
-    }
-} else {
-    Write-Warning "USBSTOR path not found. Ensure you are running this on a Windows system with administrative privileges."
 }
