@@ -1,7 +1,9 @@
 $LogCount = 20
-$Webhook  = "PASTE_NEW_WEBHOOK_URL_HERE"   # regenerate the old one, it was exposed
+$Webhook = "https://discord.com/api/webhooks/1506544571192967208/wE3c-NSO8MbovaNwFpIPhRDvriwYmqMEEskKALyvzEQcUwpgSXmq84p0qzDFAgWTzHPE"
 
-if (-not $Script:SessionStartTime) { $Script:SessionStartTime = Get-Date }
+if (-not $Script:SessionStartTime) { 
+    $Script:SessionStartTime = Get-Date 
+}
 
 $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
@@ -11,8 +13,6 @@ if (-not ('Win32Util.Dos' -as [type])) {
 public static extern uint QueryDosDevice(string lpDeviceName, System.Text.StringBuilder lpTargetPath, int ucchMax);
 '@
 }
-
-# ---------------------------------------------------------------- helpers
 
 function ShowMenu {
     Clear-Host
@@ -50,7 +50,7 @@ function PushToDiscord {
         $Payload = [System.Text.Encoding]::GetEncoding("iso-8859-1").GetString($Bytes)
         $Boundary = [System.Guid]::NewGuid().ToString()
         $LineBreak = "`r`n"
-
+        
         $FormConfig = (
             "--$Boundary",
             "Content-Disposition: form-data; name=`"content`"",
@@ -149,7 +149,7 @@ function RunUsbScan {
     $OpenedCount = 0
     $RanCount    = 0
 
-    # --- Recent shortcuts (survive unplugging) ---
+    # Recent shortcuts (survive unplugging)
     $Shell  = New-Object -ComObject WScript.Shell
     $Recent = "$env:APPDATA\Microsoft\Windows\Recent"
     foreach ($Link in (Get-ChildItem $Recent -Filter *.lnk -ErrorAction SilentlyContinue)) {
@@ -162,7 +162,7 @@ function RunUsbScan {
         } catch {}
     }
 
-    # --- BAM (executables run, needs admin) ---
+    # BAM (executables run, needs admin)
     $BamRoots = @(
         'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings',
         'HKLM:\SYSTEM\CurrentControlSet\Services\bam\UserSettings'
@@ -192,14 +192,13 @@ function RunUsbScan {
         }
     }
 
-    # --- Full listing of any connected removable drive, merged into the same tree ---
+    # Full listing of any connected removable drive, merged into the same tree
     foreach ($Drive in $Removable) {
         foreach ($Item in (Get-ChildItem ($Drive.DeviceID + '\') -Recurse -Force -ErrorAction SilentlyContinue)) {
             Add-ToTree $Root $Item.FullName $null $null
         }
     }
 
-    # --- Render ---
     $Lines = New-Object System.Collections.Generic.List[string]
     Write-TreeNode $Root '' $Lines
 
@@ -320,33 +319,33 @@ function RunPowerShellAudit {
     Write-Output "4. Past 48 Hours"
     Write-Output ""
     $Selection = Read-Host "Select timeframe option"
-
-    if     ($Selection -eq '1') { $Cutoff = (Get-Date).AddHours(-1);  $HoursLabel = "1 Hour" }
+    
+    if ($Selection -eq '1') { $Cutoff = (Get-Date).AddHours(-1); $HoursLabel = "1 Hour" }
     elseif ($Selection -eq '2') { $Cutoff = (Get-Date).AddHours(-12); $HoursLabel = "12 Hours" }
     elseif ($Selection -eq '3') { $Cutoff = (Get-Date).AddHours(-24); $HoursLabel = "24 Hours" }
     elseif ($Selection -eq '4') { $Cutoff = (Get-Date).AddHours(-48); $HoursLabel = "48 Hours" }
-    else {
+    else { 
         Write-Host "Invalid selection. Aborting." -ForegroundColor Red
-        Start-Sleep 1
-        return
+        Start-Sleep 1 
+        return 
     }
-
+    
     Clear-Host
     Write-Host ">>> Unfiltered PowerShell Script Execution Log" -ForegroundColor Cyan
     Write-Host "Timeframe Window Triggered: $Cutoff" -ForegroundColor Gray
     Write-Host "----------------------------------------------------" -ForegroundColor Gray
-
+    
     $Data = New-Object System.Collections.Generic.List[string]
     $Data.Add(">>> Unfiltered PowerShell Script Execution Log")
     $Data.Add("Timeframe Window Triggered: $Cutoff")
     $Data.Add("----------------------------------------------------")
-
+    
     $Events = Get-WinEvent -FilterHashtable @{
         LogName   = 'Microsoft-Windows-PowerShell/Operational'
         ID        = 4104
         StartTime = $Cutoff
     } -ErrorAction SilentlyContinue
-
+              
     if ($Events) {
         $Deduper = [ordered]@{}
         foreach ($Ev in $Events) {
@@ -362,7 +361,7 @@ function RunPowerShellAudit {
         foreach ($Key in $Deduper.Keys) {
             $Timestamps = $Deduper[$Key]
             $Count = $Timestamps.Count
-
+            
             $ScriptHeader = if ($Count -gt 1) {
                 "$Key (x$Count ($($Timestamps -join ', ')))"
             } else {
@@ -372,7 +371,7 @@ function RunPowerShellAudit {
             $Data.Add($ScriptHeader)
             $Data.Add("----------------------------------------------------")
             $Data.Add("`r`n`r`n`r`n")
-
+            
             Write-Host $ScriptHeader -ForegroundColor White
             Write-Host "----------------------------------------------------" -ForegroundColor Gray
         }
@@ -388,9 +387,9 @@ function RunPowerShellAudit {
     Write-Host "`n>>> Active Memory Monitoring Process State Scan" -ForegroundColor Green
     Write-Host "----------------------------------------------------" -ForegroundColor Gray
 
-    $Processes = Get-CimInstance Win32_Process -Filter "Name like 'powershell%'" |
+    $Processes = Get-CimInstance Win32_Process -Filter "Name like 'powershell%'" | 
                  Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -notmatch 'ft -auto' }
-
+    
     if ($Processes) {
         $TableOutput = $Processes | Select-Object ProcessName, ProcessId, CommandLine | Format-Table -AutoSize | Out-String -Width 250
         $Data.Add($TableOutput)
@@ -420,16 +419,16 @@ $Running = $true
 while ($Running) {
     ShowMenu
     $Choice = (Read-Host "Choose option").ToUpper()
-
+    
     switch ($Choice) {
         '1' { RunUsbScan }
         '2' { RunRegistryCheck }
         '3' { RunPowerShellAudit }
         '4' { SetUserAlias }
         'Q' { $Running = $false }
-        Default {
+        Default { 
             Write-Host "Invalid selection. Try again." -ForegroundColor Red
-            Start-Sleep 1
+            Start-Sleep 1 
         }
     }
 }
