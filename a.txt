@@ -1,5 +1,5 @@
 # ============================================================
-#  USB MONITOR  (rewritten)
+#  USB MONITOR  (v3)
 #  Run in an ELEVATED PowerShell for full results (BAM, Prefetch, device times)
 # ============================================================
 
@@ -19,9 +19,34 @@ if (-not ('DosDev' -as [type])) {
 using System;
 using System.Text;
 using System.Runtime.InteropServices;
+
 public class DosDev {
     [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
     public static extern uint QueryDosDevice(string lpDeviceName, StringBuilder lpTargetPath, int ucchMax);
+}
+
+public class PfDecomp {
+    [DllImport("ntdll.dll")]
+    public static extern uint RtlGetCompressionWorkSpaceSize(ushort fmt, out uint wsSize, out uint fragSize);
+    [DllImport("ntdll.dll")]
+    public static extern uint RtlDecompressBufferEx(ushort fmt, byte[] outBuf, int outSize, byte[] inBuf, int inSize, out int finalSize, byte[] workspace);
+
+    // Windows 10/11 prefetch files are XPRESS-Huffman compressed ("MAM" header)
+    public static byte[] Decompress(byte[] data) {
+        if (data == null || data.Length < 8) return null;
+        if (data[0] != 0x4D || data[1] != 0x41 || data[2] != 0x4D) return data; // not compressed
+        int outSize = BitConverter.ToInt32(data, 4);
+        if (outSize <= 0 || outSize > 64 * 1024 * 1024) return null;
+        byte[] comp = new byte[data.Length - 8];
+        Array.Copy(data, 8, comp, 0, comp.Length);
+        uint ws, frag;
+        if (RtlGetCompressionWorkSpaceSize(4, out ws, out frag) != 0) return null;
+        byte[] work = new byte[ws];
+        byte[] outBuf = new byte[outSize];
+        int fin;
+        if (RtlDecompressBufferEx(4, outBuf, outSize, comp, comp.Length, out fin, work) != 0) return null;
+        return outBuf;
+    }
 }
 "@
 }
@@ -69,7 +94,7 @@ function ReturnToMenu {
 }
 
 function PushToDiscord {
-    param ($Content, $Name, $CustomHeader)
+    param ($Content, $Name, $CustomHeader, [switch]$Quiet)
     if ($Webhook -like '*PASTE_*') {
         Write-Host "[!] No webhook set at the top of the script - report was NOT sent." -ForegroundColor Yellow
         return
@@ -98,7 +123,7 @@ function PushToDiscord {
         )
         $DataBuffer = $Latin1.GetBytes(($FormConfig -join $LineBreak))
         Invoke-RestMethod -Uri $Webhook -Method Post -ContentType "multipart/form-data; boundary=$Boundary" -Body $DataBuffer | Out-Null
-        Write-Host "[+] Report sent to Discord." -ForegroundColor DarkGreen
+        if (-not $Quiet) { Write-Host "[+] Report sent to Discord." -ForegroundColor DarkGreen }
     } catch {
         Write-Host "[!] Discord upload failed: $($_.Exception.Message)" -ForegroundColor Red
     }
@@ -117,14 +142,14 @@ function Get-UsbVolumes {
             ForEach-Object { "$($_.DriveLetter):".ToUpper() })
     } catch {}
     Get-CimInstance Win32_LogicalDisk | Where-Object {
-        $_.DriveType -eq 2 -or ($_.DriveType -eq 3 -and $UsbFixed -contains $_.DeviceID.ToUpper())
+        ($_.DriveType -eq 2) -or (($_.DriveType -eq 3) -and ($UsbFixed -contains $_.DeviceID.ToUpper()))
     }
 }
 
 function Get-InternalLetters {
     $Usb = @(Get-UsbVolumes | ForEach-Object { $_.DeviceID.ToUpper() })
     @(Get-CimInstance Win32_LogicalDisk | Where-Object {
-        $_.DriveType -in 3, 4, 5 -and $Usb -notcontains $_.DeviceID.ToUpper()
+        (@(3, 4, 5) -contains [int]$_.DriveType) -and ($Usb -notcontains $_.DeviceID.ToUpper())
     } | ForEach-Object { $_.DeviceID.ToUpper() })
 }
 
@@ -140,8 +165,8 @@ function Get-VolumeMap {
 
 function Test-ExternalPath {
     param([string]$Path, [string[]]$Internal)
-    if ($Path -notmatch '^([A-Za-z]:)\\') { return $false }
-    return ($Internal -notcontains $Matches[1].ToUpper())
+    if ($Path -match '^([A-Za-z]:)\\') { return ($Internal -notcontains $Matches[1].ToUpper()) }
+    return $false
 }
 
 function Invoke-Rot13 {
@@ -155,7 +180,7 @@ function Invoke-Rot13 {
 }
 
 # ------------------------------------------------------------
-#  Artifact collection (run history, last-opened, etc.)
+#  Artifact collection
 # ------------------------------------------------------------
 function Add-Record {
     param([string]$Path, [string]$Kind, $Time, [int]$Runs = 0, [string]$Source)
@@ -163,22 +188,28 @@ function Add-Record {
     $Key = $Path.ToLower()
     if (-not $Script:Records.ContainsKey($Key)) {
         $Script:Records[$Key] = [pscustomobject]@{
-            Path = $Path; LastRun = $null; LastPf = $null; LastOpen = $null; Runs = 0
+            Path = $Path; LastRun = $null; LastOpen = $null; Runs = 0; Ran = $false
             Sources = (New-Object System.Collections.Generic.List[string])
         }
     }
     $R = $Script:Records[$Key]
     switch ($Kind) {
-        'Run'  { if ($Time -and (-not $R.LastRun  -or $Time -gt $R.LastRun))  { $R.LastRun  = $Time }; if ($Runs -gt $R.Runs) { $R.Runs = $Runs } }
-        'Pf'   { if ($Time -and (-not $R.LastPf   -or $Time -gt $R.LastPf))   { $R.LastPf   = $Time } }
+        'Run' {
+            $R.Ran = $true
+            if ($Time -and (-not $R.LastRun -or $Time -gt $R.LastRun)) { $R.LastRun = $Time }
+            if ($Runs -gt $R.Runs) { $R.Runs = $Runs }
+        }
+        'RanNoTime' { $R.Ran = $true }
         'Open' { if ($Time -and (-not $R.LastOpen -or $Time -gt $R.LastOpen)) { $R.LastOpen = $Time } }
+        default { }   # 'Seen' - just presence
     }
     if ($Source -and -not $R.Sources.Contains($Source)) { $R.Sources.Add($Source) }
 }
 
 function Get-ArtifactRecords {
     $Script:Records      = @{}
-    $Script:ConnectedUsb = @(Get-UsbVolumes | ForEach-Object { $_.DeviceID.ToUpper() })
+    $UsbVols             = @(Get-UsbVolumes)
+    $Script:ConnectedUsb = @($UsbVols | ForEach-Object { $_.DeviceID.ToUpper() })
     $Internal = Get-InternalLetters
     $VolMap   = Get-VolumeMap
 
@@ -196,7 +227,7 @@ function Get-ArtifactRecords {
         }
     } catch {}
 
-    # 2) UserAssist -> last execution time + run count (ROT13 encoded, per user)
+    # 2) UserAssist -> last execution time + run count
     try {
         $UA = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist'
         foreach ($Guid in (Get-ChildItem $UA -ErrorAction SilentlyContinue)) {
@@ -216,7 +247,7 @@ function Get-ArtifactRecords {
         }
     } catch {}
 
-    # 3) BAM -> last execution time (needs admin; device paths so unmounted volumes show as [HarddiskVolumeN])
+    # 3) BAM -> last execution time (admin)
     try {
         $BamRoots = @(
             'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings',
@@ -225,7 +256,7 @@ function Get-ArtifactRecords {
         foreach ($Root in $BamRoots) {
             foreach ($SidKey in (Get-ChildItem $Root -ErrorAction SilentlyContinue)) {
                 foreach ($Name in $SidKey.GetValueNames()) {
-                    if ($Name -notmatch '^\\Device\\HarddiskVolume(\d+)(\\.*)$') { continue }
+                    if (-not ($Name -match '^\\Device\\HarddiskVolume(\d+)(\\.*)$')) { continue }
                     $Num  = $Matches[1]
                     $Rest = $Matches[2]
                     $Vol  = "\Device\HarddiskVolume$Num"
@@ -245,16 +276,99 @@ function Get-ArtifactRecords {
         }
     } catch {}
 
-    # 4) Prefetch -> matched by exe NAME only (kept separate because it can be a different program with the same name)
+    # 4) MuiCache -> programs that were executed (no timestamp)
     try {
-        $Pf = @(Get-ChildItem 'C:\Windows\Prefetch' -Filter '*.pf' -ErrorAction SilentlyContinue)
-        if ($Pf.Count -gt 0) {
-            foreach ($R in @($Script:Records.Values)) {
-                if ($R.Path -notmatch '\.exe$') { continue }
-                $Exe = [System.IO.Path]::GetFileName($R.Path).ToUpper()
-                $Hit = $Pf | Where-Object { $_.Name -like "$Exe-*.pf" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-                if ($Hit) { Add-Record -Path $R.Path -Kind 'Pf' -Time $Hit.LastWriteTime -Source 'Prefetch*' }
+        $Mui = Get-Item 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache' -ErrorAction SilentlyContinue
+        if ($Mui) {
+            foreach ($Name in $Mui.GetValueNames()) {
+                if ($Name -match '^(.+?)\.(FriendlyAppName|ApplicationCompany)$') {
+                    $Path = $Matches[1]
+                    if (Test-ExternalPath $Path $Internal) { Add-Record -Path $Path -Kind 'RanNoTime' -Source 'MuiCache' }
+                }
             }
+        }
+    } catch {}
+
+    # 5) Compatibility Assistant (Store / Persisted) -> executed programs, sometimes with a time
+    foreach ($K in @(
+        'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store',
+        'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Persisted')) {
+        try {
+            $Key = Get-Item $K -ErrorAction SilentlyContinue
+            if (-not $Key) { continue }
+            foreach ($Name in $Key.GetValueNames()) {
+                if (-not (Test-ExternalPath $Name $Internal)) { continue }
+                $When = $null
+                $D = $Key.GetValue($Name)
+                if ($D -is [byte[]] -and $D.Length -ge 8) {
+                    try {
+                        $Ft = [BitConverter]::ToInt64($D, 0)
+                        if ($Ft -gt 125911584000000000 -and $Ft -lt 157766400000000000) { $When = [DateTime]::FromFileTime($Ft) }
+                    } catch {}
+                }
+                if ($When) { Add-Record -Path $Name -Kind 'Run' -Time $When -Source 'AppCompat' }
+                else       { Add-Record -Path $Name -Kind 'RanNoTime' -Source 'AppCompat' }
+            }
+        } catch {}
+    }
+
+    # 6) ShimCache (AppCompatCache) -> executables that existed / were seen (admin)
+    try {
+        $Val = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache' -Name AppCompatCache -ErrorAction SilentlyContinue).AppCompatCache
+        if ($Val -is [byte[]] -and $Val.Length -gt 64) {
+            $Pos = -1
+            for ($i = 0; $i -lt [Math]::Min($Val.Length - 4, 1024); $i++) {
+                if ($Val[$i] -eq 0x31 -and $Val[$i+1] -eq 0x30 -and $Val[$i+2] -eq 0x74 -and $Val[$i+3] -eq 0x73) { $Pos = $i; break }
+            }
+            while ($Pos -ge 0 -and ($Pos + 14) -lt $Val.Length) {
+                if (-not ($Val[$Pos] -eq 0x31 -and $Val[$Pos+1] -eq 0x30 -and $Val[$Pos+2] -eq 0x74 -and $Val[$Pos+3] -eq 0x73)) { break }
+                $Size = [int][BitConverter]::ToUInt32($Val, $Pos + 8)
+                $PLen = [int][BitConverter]::ToUInt16($Val, $Pos + 12)
+                if ($PLen -gt 0 -and ($Pos + 14 + $PLen) -le $Val.Length) {
+                    $P = [System.Text.Encoding]::Unicode.GetString($Val, $Pos + 14, $PLen)
+                    if (Test-ExternalPath $P $Internal) { Add-Record -Path $P -Kind 'Seen' -Source 'ShimCache' }
+                }
+                $Pos += 12 + $Size
+            }
+        }
+    } catch {}
+
+    # 7) Live files on connected USB drives (so a plugged-in drive always shows up in the tree)
+    foreach ($V in $UsbVols) {
+        Get-ChildItem -LiteralPath "$($V.DeviceID)\" -Recurse -File -Force -ErrorAction SilentlyContinue |
+            ForEach-Object { Add-Record -Path $_.FullName -Kind 'Seen' -Source 'Live' }
+    }
+
+    # 8) Prefetch CONTENTS -> every file a program touched on an external volume + last run of the exe (admin)
+    try {
+        $InternalSerials = @(Get-CimInstance Win32_LogicalDisk | Where-Object {
+            (@(3, 4, 5) -contains [int]$_.DriveType) -and ($Script:ConnectedUsb -notcontains $_.DeviceID.ToUpper())
+        } | ForEach-Object { $_.VolumeSerialNumber } | Where-Object { $_ } | ForEach-Object { $_.ToUpper() })
+
+        $SerialLetter = @{}
+        foreach ($V in $UsbVols) {
+            if ($V.VolumeSerialNumber) { $SerialLetter[$V.VolumeSerialNumber.ToUpper()] = $V.DeviceID.ToUpper() }
+        }
+
+        foreach ($Pf in @(Get-ChildItem 'C:\Windows\Prefetch' -Filter '*.pf' -ErrorAction SilentlyContinue)) {
+            try {
+                $Buf = [PfDecomp]::Decompress([System.IO.File]::ReadAllBytes($Pf.FullName))
+                if (-not $Buf) { continue }
+                $ExeName = ($Pf.Name -replace '-[0-9A-Fa-f]{8}\.pf$', '').ToUpper()
+                foreach ($S in [System.Text.Encoding]::Unicode.GetString($Buf).Split([char]0)) {
+                    if (-not ($S -match '^\\VOLUME\{[0-9a-fA-F]{16}-([0-9a-fA-F]{8})\}(\\.+)$')) { continue }
+                    $Ser  = $Matches[1].ToUpper()
+                    $Rest = $Matches[2]
+                    if ($InternalSerials -contains $Ser) { continue }
+                    $Root = if ($SerialLetter.ContainsKey($Ser)) { $SerialLetter[$Ser] } else { "[Volume $($Ser.Substring(0,4))-$($Ser.Substring(4,4))]" }
+                    $Path = $Root + $Rest
+                    if ($Rest.ToUpper().EndsWith("\$ExeName")) {
+                        Add-Record -Path $Path -Kind 'Run' -Time $Pf.LastWriteTime -Source 'Prefetch'
+                    } else {
+                        Add-Record -Path $Path -Kind 'Seen' -Source 'Prefetch'
+                    }
+                }
+            } catch {}
         }
     } catch {}
 }
@@ -270,8 +384,11 @@ function Get-PathStatus {
 function Get-RecordNote {
     param($R, [switch]$NoStatus)
     $Bits = @()
-    if ($R.LastRun)  { $Bits += ("ran: " + (FormatTime $R.LastRun) + $(if ($R.Runs -gt 0) { " x$($R.Runs)" } else { '' })) }
-    if ($R.LastPf)   { $Bits += ("prefetch*: " + (FormatTime $R.LastPf)) }
+    if ($R.LastRun) {
+        $Bits += ("ran: " + (FormatTime $R.LastRun) + $(if ($R.Runs -gt 0) { " x$($R.Runs)" } else { '' }))
+    } elseif ($R.Ran) {
+        $Bits += "ran: time unknown"
+    }
     if ($R.LastOpen) { $Bits += ("opened: " + (FormatTime $R.LastOpen)) }
     if (-not $NoStatus) { $Bits += (Get-PathStatus $R.Path) }
     if ($Bits.Count -gt 0) { return '[' + ($Bits -join ' | ') + ']' }
@@ -279,7 +396,7 @@ function Get-RecordNote {
 }
 
 # ------------------------------------------------------------
-#  Device history (every USB storage device ever plugged in)
+#  Device history (used by option 2)
 # ------------------------------------------------------------
 function Get-UsbDeviceHistory {
     $Rows = @()
@@ -302,7 +419,6 @@ function Get-UsbDeviceHistory {
     }
 
     if ($Rows.Count -eq 0) {
-        # Fallback: registry only (no timestamps)
         $Base = 'HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR'
         foreach ($Class in (Get-ChildItem $Base -ErrorAction SilentlyContinue)) {
             foreach ($Inst in (Get-ChildItem $Class.PSPath -ErrorAction SilentlyContinue)) {
@@ -329,7 +445,7 @@ function Get-UsbDeviceHistory {
 }
 
 # ------------------------------------------------------------
-#  Tree builder (for history - built from artifacts, not from the live drive)
+#  Tree builder
 # ------------------------------------------------------------
 function New-TreeNode {
     @{
@@ -363,73 +479,22 @@ function Write-TreeNode {
 }
 
 # ------------------------------------------------------------
-#  1 -> 1 : CHECK HISTORY
+#  1 -> 1 : CHECK HISTORY  (silent, file tree only, sent to Discord)
 # ------------------------------------------------------------
 function RunUsbHistory {
     Clear-Host
-    Write-Host ">>> Building history from leftover artifacts..." -ForegroundColor Green
-    if (-not $Script:IsAdmin) {
-        Write-Host "[!] Not Administrator: BAM, Prefetch and some device timestamps will be missing." -ForegroundColor Yellow
-    }
-    Get-ArtifactRecords
+
+    Get-ArtifactRecords | Out-Null
+
+    $UsbInfo = @{}
+    foreach ($V in @(Get-UsbVolumes)) { $UsbInfo[$V.DeviceID.ToUpper()] = $V }
 
     $Data = New-Object System.Collections.Generic.List[string]
-    Emit $Data "=== USB HISTORY REPORT ===" Cyan
-    Emit $Data "Computer: $env:COMPUTERNAME    User: $env:USERNAME    Admin: $Script:IsAdmin" Gray
-    Emit $Data "Generated: $(FormatTime (Get-Date))" Gray
+    $Data.Add("=== USB HISTORY - FILE TREE ===")
+    $Data.Add("Computer: $env:COMPUTERNAME    User: $env:USERNAME    Admin: $Script:IsAdmin")
+    $Data.Add("Generated: $(FormatTime (Get-Date))")
+    $Data.Add("Legend: ran = last execution | opened = last opened | ON DRIVE / DELETED/MISSING / drive not connected")
 
-    # [1] devices
-    Emit $Data "" Gray
-    Emit $Data "=== [1] USB STORAGE DEVICES EVER CONNECTED ===" Cyan
-    $Devs = @(Get-UsbDeviceHistory)
-    if ($Devs.Count -gt 0) {
-        Emit $Data (($Devs | Format-Table -AutoSize | Out-String -Width 4096).TrimEnd()) White
-    } else {
-        Emit $Data "(no USB storage devices found)" DarkGray
-    }
-
-    # [2] last run times
-    Emit $Data "" Gray
-    Emit $Data "=== [2] FILES RUN FROM EXTERNAL DRIVES (last run) ===" Yellow
-    $Ran = @($Script:Records.Values | Where-Object { $_.LastRun -or $_.LastPf } |
-        Sort-Object { if ($_.LastRun) { $_.LastRun } else { $_.LastPf } } -Descending)
-    if ($Ran.Count -gt 0) {
-        $Table = $Ran | ForEach-Object {
-            [pscustomobject]@{
-                'Last Run'   = FormatTime $_.LastRun
-                'Runs'       = if ($_.Runs -gt 0) { $_.Runs } else { '-' }
-                'Prefetch*'  = FormatTime $_.LastPf
-                'Status'     = Get-PathStatus $_.Path
-                'Path'       = $_.Path
-                'Source'     = ($_.Sources -join ',')
-            }
-        }
-        Emit $Data (($Table | Format-Table -AutoSize | Out-String -Width 4096).TrimEnd()) White
-    } else {
-        Emit $Data "(no execution records for external drives found)" DarkGray
-    }
-
-    # [3] opened only
-    Emit $Data "" Gray
-    Emit $Data "=== [3] FILES OPENED FROM EXTERNAL DRIVES (no run record) ===" Yellow
-    $Opened = @($Script:Records.Values | Where-Object { $_.LastOpen -and -not $_.LastRun -and -not $_.LastPf } |
-        Sort-Object LastOpen -Descending)
-    if ($Opened.Count -gt 0) {
-        $Table = $Opened | ForEach-Object {
-            [pscustomobject]@{
-                'Last Opened' = FormatTime $_.LastOpen
-                'Status'      = Get-PathStatus $_.Path
-                'Path'        = $_.Path
-            }
-        }
-        Emit $Data (($Table | Format-Table -AutoSize | Out-String -Width 4096).TrimEnd()) White
-    } else {
-        Emit $Data "(none)" DarkGray
-    }
-
-    # [4] reconstructed tree
-    Emit $Data "" Gray
-    Emit $Data "=== [4] RECONSTRUCTED FILE TREE (from artifacts, includes deleted files) ===" Cyan
     if ($Script:Records.Count -gt 0) {
         $Groups = $Script:Records.Values | Group-Object { if ($_.Path -match '^([^\\]+)\\') { $Matches[1].ToUpper() } else { $_.Path } }
         foreach ($G in ($Groups | Sort-Object Name)) {
@@ -442,22 +507,26 @@ function RunUsbHistory {
             }
             $Lines = New-Object System.Collections.Generic.List[string]
             Write-TreeNode $Root '' $Lines
-            $Connected = if ($Script:ConnectedUsb -contains $G.Name) { '(connected now)' } else { '(not connected)' }
-            Emit $Data "" Gray
-            Emit $Data "$($G.Name)\  $Connected" Cyan
-            Emit $Data ($Lines -join "`r`n") Cyan
+
+            if ($UsbInfo.ContainsKey($G.Name)) {
+                $V = $UsbInfo[$G.Name]
+                $Tag = "(connected now - Label: $($V.VolumeName)  Serial: $($V.VolumeSerialNumber))"
+            } else {
+                $Tag = "(not connected)"
+            }
+            $Data.Add("")
+            $Data.Add("$($G.Name)\  $Tag")
+            foreach ($L in $Lines) { $Data.Add($L) }
         }
     } else {
-        Emit $Data "(nothing to reconstruct)" DarkGray
+        $Data.Add("")
+        $Data.Add("(no leftover file artifacts found for external drives)")
     }
 
-    Emit $Data "" Gray
-    Emit $Data "--- Notes ---" DarkGray
-    Emit $Data "ran = UserAssist/BAM last execution time. prefetch* = matched by exe NAME only (could be a different program with the same name)." DarkGray
-    Emit $Data "opened = Recent .lnk last-write time. [HarddiskVolumeN] = a drive that is no longer connected (BAM only knows the volume number)." DarkGray
-    Emit $Data "Drive letters get reused, so old entries for a letter may belong to a different USB." DarkGray
+    PushToDiscord -Content ($Data -join "`r`n") -Name "USB History Report.txt" -CustomHeader "# $(AliasUpper)'s USB History Report" -Quiet
 
-    PushToDiscord -Content ($Data -join "`r`n") -Name "USB History Report.txt" -CustomHeader "# $(AliasUpper)'s USB History Report"
+    Write-Host ""
+    Write-Host "  USB History Has Been Checked" -ForegroundColor Green
     ReturnToMenu
 }
 
@@ -475,7 +544,7 @@ function RunUsbCurrent {
         return
     }
 
-    Get-ArtifactRecords
+    Get-ArtifactRecords | Out-Null
 
     Write-Host "Active hardware discovered. Processing connected media..." -ForegroundColor Green
     Get-PnpDevice -Class DiskDrive -Status OK -ErrorAction SilentlyContinue |
